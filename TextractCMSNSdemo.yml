@@ -1,0 +1,348 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Radiology report NLP demo
+
+Parameters:
+  ReportBucketName:
+    Type: String
+    Default: city-of-hope-bucket
+  DDBTableName:
+    Type: String 
+    Default: city-of-hope-ddbtable
+  EmailNotification:
+    Description: Enter email address to notify processing errors
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: '[a-zA-Z0-9._@]*[a-z0-9A-Z]'
+    ConstraintDescription: must begin with a letter and contain only  alphanumeric
+
+Mappings: 
+  RegionMap: 
+    us-east-1:
+      LambdaBucket: medical-image-search-us-east-1
+    us-east-2:
+      LambdaBucket: medical-image-search-us-east-2
+    us-west-1:
+      LambdaBucket: medical-image-search-us-west-1
+    us-west-2:
+      LambdaBucket: medical-image-search-us-west-2
+    ap-south-1:
+      LambdaBucket: medical-image-search-ap-south-1
+    ap-northeast-1:
+      LambdaBucket: medical-image-search-ap-northeast-1
+    ap-northeast-2:
+      LambdaBucket: medical-image-search-ap-northeast-2
+    ap-southeast-1:
+      LambdaBucket: medical-image-search-ap-southeast-1
+    ap-southeast-2:
+      LambdaBucket: medical-image-search-ap-southeast-2
+    ca-central-1:
+      LambdaBucket: medical-image-search-ca-central-1
+    eu-central-1:
+      LambdaBucket: medical-image-search-eu-central-1
+    eu-west-1:
+      LambdaBucket: medical-image-search-eu-west-1
+    eu-west-2:
+      LambdaBucket: medical-image-search-eu-west-2
+    eu-west-3:
+      LambdaBucket: medical-image-search-eu-west-3
+    eu-north-1:
+      LambdaBucket: medical-image-search-eu-north-1
+    sa-east-1:
+      LambdaBucket: medical-image-search-sa-east-1
+      
+Resources:
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Description: Radiology Report table
+    Properties:
+      TableName: !Ref DDBTableName
+      AttributeDefinitions:
+        - AttributeName: EntityId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: EntityId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 50
+        WriteCapacityUnits: 20
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ReportBucketName
+  ReportLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CMprocessLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ReportBucket.Arn
+  CMprocessLambdaFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: 'S3Notification'
+                Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ReportBucket.Arn
+                  - !Join
+                    - ''
+                    - - !GetAtt ReportBucket.Arn
+                      - /*
+              - Sid: 'LogGroup'
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Sid: Others
+                Effect: Allow
+                Action: 
+                  - dynamodb:*
+                  - comprehend:*
+                  - sns:*
+                  - textract:*
+                  - comprehendmedical:*
+                Resource: '*'
+  SNSTopic:
+    Type: AWS::SNS::Topic
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref 'EmailNotification'
+      Protocol: email
+      TopicArn: !Ref 'SNSTopic'
+  LambdaDependencyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.6
+        - python3.7
+      Content:
+        S3Bucket: !FindInMap [RegionMap, !Ref "AWS::Region", LambdaBucket]
+        S3Key: python.zip 
+      Description: Dependencies for Lambda functions
+      LayerName: lambda-dependency-layer
+  CMprocessLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaDependencyLayer
+    Properties:
+      Description: a lambda function that transform the free text into searchable named entities using Amazon Comprehend Medical and index them in Elasticsearch
+      Role: !GetAtt CMprocessLambdaFunctionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      Layers: 
+        - !Ref LambdaDependencyLayer
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          awsregion: !Sub ${AWS::Region}
+          ddb_table: !Ref DDBTable
+          snsArn: !Ref SNSTopic
+      Code:
+        ZipFile: |
+            import json
+            import boto3
+            import os
+            import re
+            import sys
+            import time
+            import logging
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            from urllib.parse import unquote_plus
+            region=os.environ['awsregion']
+            s3client=boto3.client('s3')
+            cm = boto3.client('comprehendmedical')
+            textract = boto3.client('textract')
+            dynamodb = boto3.resource('dynamodb')
+            sns = boto3.client('sns')
+            ddbtable = dynamodb.Table(os.environ['ddb_table'])
+            snstopic=os.environ['snsArn']
+            def lambda_handler(event, context):
+                try:
+                    for record in event['Records']:
+                        bucket=record['s3']['bucket']['name']
+                        key=unquote_plus(record['s3']['object']['key'])
+                        reportid=key[(key.find('/')+1):(key.find('.'))]
+                        if key.endswith('pdf'):
+                            response = textract.start_document_text_detection(
+                                DocumentLocation={
+                                    'S3Object': {
+                                        'Bucket': bucket,
+                                        'Name': key
+                                    }
+                                }
+                            )
+                            jobId=response["JobId"]
+                            time.sleep(5)
+                            response = textract.get_document_text_detection(JobId=jobId)
+                            while(response["JobStatus"] == "IN_PROGRESS"):
+                                time.sleep(5)
+                                response = textract.get_document_text_detection(JobId=jobId)
+                            response = textract.get_document_text_detection(JobId=jobId)
+                            lines = []
+                            for b in response['Blocks']:
+                                if b["BlockType"] == "LINE":
+                                    lines.append(b["Text"])
+                            content = '\n'.join(lines)
+                            logger.info(content)
+                        else:
+                            content=s3client.get_object(Bucket=bucket, Key=key)['Body'].read().decode()
+                        entities=cm.infer_icd10_cm(Text=content)['Entities']
+                        for i in entities:
+                            icd10=i['ICD10CMConcepts'][0]
+                            trts=i['Traits']
+                            pos=1
+                            for t in trts:
+                                if t['Name']=='NEGATION':
+                                    pos=0
+                            if pos>0:
+                                response = ddbtable.put_item(
+                                    Item={
+                                        'EntityId': '{0}_{1}'.format(reportid, i['Id']),
+                                        'Text': i['Text'],
+                                        'ICD10CMDescription': icd10['Description'],
+                                        'ICD10CMCode': icd10['Code']
+                                    }
+                                )
+                        response = sns.publish(
+                            TargetArn=snstopic, 
+                            Message=content, 
+                            Subject='Congratulations! Your Named Entity Detection job is finished!'
+                        )
+                except Exception as E:
+                    logger.error(E)
+
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                Resource: 
+                  - !GetAtt ReportBucket.Arn
+                  - !Join
+                    - ''
+                    - - !GetAtt ReportBucket.Arn
+                      - /*
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'FAILED': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'
+                          ]
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.6
+      Timeout: 50
+  ReportLambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: ReportLambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt CMprocessLambdaFunction.Arn
+      Bucket: !Ref ReportBucket
+
+
+
+          
