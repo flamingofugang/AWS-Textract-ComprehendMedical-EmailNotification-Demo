@@ -1,15 +1,15 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: 'AWS::Serverless-2016-10-31'
-Description: Radiology report NLP demo
+Description: Clinical note Amazon Textract and Comprehend Medical demo
 
 Parameters:
-  ReportBucketName:
+  UploadBucketName:
     Type: String
-    Default: city-of-hope-bucket
+    Default: pdffile-upload-bucket
   DDBTableName:
     Type: String 
-    Default: city-of-hope-ddbtable
+    Default: icd10-ddbtable
   EmailNotification:
     Description: Enter email address to notify processing errors
     Type: String
@@ -17,41 +17,6 @@ Parameters:
     MaxLength: '64'
     AllowedPattern: '[a-zA-Z0-9._@]*[a-z0-9A-Z]'
     ConstraintDescription: must begin with a letter and contain only  alphanumeric
-
-Mappings: 
-  RegionMap: 
-    us-east-1:
-      LambdaBucket: medical-image-search-us-east-1
-    us-east-2:
-      LambdaBucket: medical-image-search-us-east-2
-    us-west-1:
-      LambdaBucket: medical-image-search-us-west-1
-    us-west-2:
-      LambdaBucket: medical-image-search-us-west-2
-    ap-south-1:
-      LambdaBucket: medical-image-search-ap-south-1
-    ap-northeast-1:
-      LambdaBucket: medical-image-search-ap-northeast-1
-    ap-northeast-2:
-      LambdaBucket: medical-image-search-ap-northeast-2
-    ap-southeast-1:
-      LambdaBucket: medical-image-search-ap-southeast-1
-    ap-southeast-2:
-      LambdaBucket: medical-image-search-ap-southeast-2
-    ca-central-1:
-      LambdaBucket: medical-image-search-ca-central-1
-    eu-central-1:
-      LambdaBucket: medical-image-search-eu-central-1
-    eu-west-1:
-      LambdaBucket: medical-image-search-eu-west-1
-    eu-west-2:
-      LambdaBucket: medical-image-search-eu-west-2
-    eu-west-3:
-      LambdaBucket: medical-image-search-eu-west-3
-    eu-north-1:
-      LambdaBucket: medical-image-search-eu-north-1
-    sa-east-1:
-      LambdaBucket: medical-image-search-sa-east-1
       
 Resources:
   DDBTable:
@@ -68,10 +33,10 @@ Resources:
       ProvisionedThroughput:
         ReadCapacityUnits: 50
         WriteCapacityUnits: 20
-  ReportBucket:
+  UploadBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref ReportBucketName
+      BucketName: !Ref UploadBucketName
   ReportLambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -79,7 +44,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
-      SourceArn: !GetAtt ReportBucket.Arn
+      SourceArn: !GetAtt UploadBucket.Arn
   CMprocessLambdaFunctionRole:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -106,10 +71,10 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - !GetAtt ReportBucket.Arn
+                  - !GetAtt UploadBucket.Arn
                   - !Join
                     - ''
-                    - - !GetAtt ReportBucket.Arn
+                    - - !GetAtt UploadBucket.Arn
                       - /*
               - Sid: 'LogGroup'
                 Effect: Allow
@@ -135,27 +100,13 @@ Resources:
       Endpoint: !Ref 'EmailNotification'
       Protocol: email
       TopicArn: !Ref 'SNSTopic'
-  LambdaDependencyLayer:
-    Type: AWS::Lambda::LayerVersion
-    Properties:
-      CompatibleRuntimes:
-        - python3.6
-        - python3.7
-      Content:
-        S3Bucket: !FindInMap [RegionMap, !Ref "AWS::Region", LambdaBucket]
-        S3Key: python.zip 
-      Description: Dependencies for Lambda functions
-      LayerName: lambda-dependency-layer
   CMprocessLambdaFunction:
     Type: AWS::Lambda::Function
-    DependsOn: LambdaDependencyLayer
     Properties:
-      Description: a lambda function that transform the free text into searchable named entities using Amazon Comprehend Medical and index them in Elasticsearch
+      Description: a lambda function that run Textract for PDF file and Comprehend Medical for NER and send SNS message
       Role: !GetAtt CMprocessLambdaFunctionRole.Arn
       Handler: index.lambda_handler
       Runtime: python3.6
-      Layers: 
-        - !Ref LambdaDependencyLayer
       MemorySize: 512
       Timeout: 60
       Environment:
@@ -210,7 +161,6 @@ Resources:
                                 if b["BlockType"] == "LINE":
                                     lines.append(b["Text"])
                             content = '\n'.join(lines)
-                            logger.info(content)
                         else:
                             content=s3client.get_object(Bucket=bucket, Key=key)['Body'].read().decode()
                         entities=cm.infer_icd10_cm(Text=content)['Entities']
@@ -260,10 +210,10 @@ Resources:
                   - 's3:GetBucketNotification'
                   - 's3:PutBucketNotification'
                 Resource: 
-                  - !GetAtt ReportBucket.Arn
+                  - !GetAtt UploadBucket.Arn
                   - !Join
                     - ''
-                    - - !GetAtt ReportBucket.Arn
+                    - - !GetAtt UploadBucket.Arn
                       - /*
               - Effect: Allow
                 Action:
@@ -341,7 +291,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
       LambdaArn: !GetAtt CMprocessLambdaFunction.Arn
-      Bucket: !Ref ReportBucket
+      Bucket: !Ref UploadBucket
 
 
 
